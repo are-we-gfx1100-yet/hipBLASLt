@@ -529,7 +529,8 @@ class GlobalWriteBatchWriter:
           vmcnt = self.loadsIssued + self.loadsScaleDIssued - waitLoadCnt
 
           if self.parentWriter.states.archCaps["SeparateVscnt"]:
-            waitStoreCnt = 0
+            waitStoreCnt = -1
+            vmcnt = 0 if vmcnt < 0 else vmcnt
             vmComment = "{} = {} - {} - 1".format(vmcnt, self.loadsIssued, waitLoadCnt)
           else:
             waitStoreCnt = self.storesIssued if not self.kernel["GroupLoadStore"] else 0
@@ -557,7 +558,8 @@ class GlobalWriteBatchWriter:
           vmcnt = self.loadsIssued + self.loadsScaleDIssued - waitLoadCnt - 1
 
           if self.parentWriter.states.archCaps["SeparateVscnt"]:
-            waitStoreCnt = 0
+            waitStoreCnt = -1
+            vmcnt = 0 if vmcnt < 0 else vmcnt
             vmComment = "{} = {} - {} - 1".format(vmcnt, self.loadsIssued, waitLoadCnt)
           else:
             waitStoreCnt = self.storesIssued if not self.kernel["GroupLoadStore"] else 0
@@ -656,6 +658,15 @@ class GlobalWriteBatchWriter:
                                         inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
           packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.tmpVgpr, self.tmpS01,
                                      SaturateTypeInt8=SaturateTypeInt8, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+
+      if self.parentWriter.states.asmCaps["HasWMMA"] and self.kernel["EnableMatrixInstruction"] and self.kernel["ProblemType"]["DestDataType"].isHalf() and (not self.kernel["ProblemType"]["HighPrecisionAccumulate"]):
+        for vi in range(0, self.gwvw):
+          sumIdxV = self.ss.elementSumIdx[elementIdx] + vi
+          if vi%2 == 1:
+            formatVgpr = formatting(sumIdxV, "ValuC+", self.parentWriter.states.c.startVgprValu)
+            d = self.ss.elementSumIdx[elementIdx] + vi//2
+            packModule.add(VPackF16toB32(dst=vgpr(d), src0=vgpr(formatting(sumIdxV-1, "ValuC+", self.parentWriter.states.c.startVgprValu)), src1=vgpr(formatVgpr), \
+                          comment="Pack with neighbor"))
 
       scaleDModule = Module("scaleDModule")
       if self.kernel["ProblemType"]["UseScaleD"] and (self.kernel["GlobalSplitU"] == 1):
@@ -1168,7 +1179,18 @@ class GlobalWriteBatchWriter:
       sumIdxV = ss.elementSumIdx[elementIdx] + vi
       if kernel["ProblemType"]["DestDataType"].isHalf():
         if not kernel["ProblemType"]["HighPrecisionAccumulate"]:
-          if sumIdxV%2==0 or (not ss.cfg.halfDataRegPerVI and gwvw==1):
+          if self.parentWriter.states.asmCaps["HasWMMA"] and kernel["EnableMatrixInstruction"]:
+            dataV = ss.elementData[elementIdx] + int(vi / 2 * ss.cfg.numVgprsPerDataPerVI)
+            if (vi % 2) == 0:
+              module.add(VMulPKF16(dst=vgpr(dataV), src0=sgpr("Beta"), src1=vgpr(dataV+0), \
+                    comment="%s = C*beta ei=%u vi=%u"%(vgpr(dataV),elementIdx, vi)))
+            else:
+              module.add(VLShiftRightB32(dst=vgpr(dataV), shiftHex=16, src=vgpr(dataV), \
+                    comment="shift 16bit to get next half of packed ValueC"))  
+            # dataV+0 = new c = old c*beta + rC
+            module.add(VAddPKF16(dst=vgpr("ValuC+%u"%(sumIdxV)), src0=vgpr(dataV), src1=vgpr("ValuC+%u"%(sumIdxV)), \
+                comment="sum*alpha + C*beta"))
+          elif sumIdxV%2==0 or (not ss.cfg.halfDataRegPerVI and gwvw==1):
             newSumIdxV = sumIdxV // 2 - self.parentWriter.states.c.startVgprValu
             # dataV+0 = new c = old c*beta
             module.add(VMulPKF16(dst=vgpr(dataV), src0=sgpr("Beta"), src1=vgpr(dataV+0), \
